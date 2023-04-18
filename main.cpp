@@ -27,13 +27,14 @@
 //#define listenfdET    //边缘触发阻塞
 
 //此三个函数在http_conn.cpp中有定义，gcc在编译的时候会自动链接
-extern int addfd(int epollfd, int fd, bool one_shot);
-extern int remove(int epollfd, int fd);
-extern int setnonblocking(int fd);
+int addfd(int epollfd, int fd, bool one_shot);
+int removefd(int epollfd, int fd);
+int setnonblocking(int fd);
 
 //设置定时器相关参数
 static int pipefd[2];           //管道，用于进程间通信
 static sort_timer_lst timer_lst;
+
 static int epollfd = 0;         //epoll例程(指向被监视文件描述符的保存空间)
 
 //信号处理函数，这里只是用于通知主线程，并不处理，缩短异步处理时间，减少对主程序的影响
@@ -58,7 +59,7 @@ void addsig(int sig, void(handler)(int), bool restart = true){
 	memset(&sa, 0, sizeof(sa));
 	
 	//信号处理器中仅通知主线程，不作处理
-	sa.sa_hanlder = handler;
+	sa.sa_handler = handler;
 	if(restart)
 		sa.sa_flags |= SA_RESTART;
 	
@@ -67,6 +68,13 @@ void addsig(int sig, void(handler)(int), bool restart = true){
 	
 	//注册信号类型对应的信号处理器(信号处理函数)
 	assert(sigaction(sig, &sa, NULL) != -1);
+}
+
+//定时处理任务，重新定时以不断触发SIGALRM信号
+void timer_handler()
+{
+    timer_lst.tick();
+    alarm(TIMESLOT);
 }
 
 
@@ -80,6 +88,16 @@ void cb_func(client_data *user_data){
 	
 	//减少连接数
 	http_conn::m_user_count--;
+
+	LOG_INFO("close fd %d", user_data->sockfd);
+    Log::get_instance()->flush();
+}
+
+void show_error(int connfd, const char *info)
+{
+    printf("%s", info);
+    send(connfd, info, strlen(info), 0);
+    close(connfd);
 }
 
 int main(int argc, char *argv[]){
@@ -97,7 +115,7 @@ int main(int argc, char *argv[]){
 		return 1;
 	}
 	
-	init port = atoi(argv[1]);
+	int port = atoi(argv[1]);
 	
 	addsig(SIGPIPE, SIG_IGN);
 	
@@ -109,7 +127,7 @@ int main(int argc, char *argv[]){
 	threadpool<http_conn> *pool = NULL;
 	try{
 		pool = new threadpool<http_conn>(connPool);
-	}catch(...){         //三个点表示任意类型参数
+	}catch(...){         //三个点表示任意类型参数,可捕获任意异常
 		return 1;
 	}
 	
@@ -183,10 +201,103 @@ int main(int argc, char *argv[]){
 		//轮询所有就绪事件并处理
 		for(int i=0; i < number; i++){
 		  int sockfd = events[i].data.fd;
-		  
+
+		  //1.处理新到的客户连接
+          if (sockfd == listenfd)
+            {
+				//初始化客户端连接地址
+                struct sockaddr_in client_address;
+                socklen_t client_addrlength = sizeof(client_address);
+#ifdef listenfdLT
+
+				//该连接分配的文件描述符
+                int connfd = accept(listenfd, (struct sockaddr *)&client_address, &client_addrlength);
+                if (connfd < 0)
+                {
+                    LOG_ERROR("%s:errno is:%d", "accept error", errno);
+                    continue;
+                }
+                if (http_conn::m_user_count >= MAX_FD)
+                {
+                    show_error(connfd, "Internal server busy");
+                    LOG_ERROR("%s", "Internal server busy");
+                    continue;
+                }
+                users[connfd].init(connfd, client_address);
+
+                //初始化client_data数据（连接资源）
+                //创建定时器，设置回调函数和超时时间，绑定用户数据，将定时器添加到链表中
+                users_timer[connfd].address = client_address;
+                users_timer[connfd].sockfd = connfd;
+
+				//创建定时器临时变量
+                util_timer *timer = new util_timer;
+				//设置定时器对应的连接资源
+                timer->user_data = &users_timer[connfd];
+				//设置回调函数
+                timer->cb_func = cb_func;
+                time_t cur = time(NULL);
+				//设置绝对超时时间
+                timer->expire = cur + 3 * TIMESLOT;
+				//创建该连接对应的定时器，初始化为前述临时变量
+                users_timer[connfd].timer = timer;
+				//将该定时器添加到链表中
+                timer_lst.add_timer(timer);
+#endif
+
+#ifdef listenfdET
+                //需要循环接收数据
+                while (1)
+                {
+                    int connfd = accept(listenfd, (struct sockaddr *)&client_address, &client_addrlength);
+                    if (connfd < 0)
+                    {
+                        LOG_ERROR("%s:errno is:%d", "accept error", errno);
+                        break;
+                    }
+                    if (http_conn::m_user_count >= MAX_FD)
+                    {
+                        show_error(connfd, "Internal server busy");
+                        LOG_ERROR("%s", "Internal server busy");
+                        break;
+                    }
+                    users[connfd].init(connfd, client_address);
+
+                    //初始化client_data数据
+                    //创建定时器，设置回调函数和超时时间，绑定用户数据，将定时器添加到链表中
+                    users_timer[connfd].address = client_address;
+                    users_timer[connfd].sockfd = connfd;
+                    util_timer *timer = new util_timer;
+                    timer->user_data = &users_timer[connfd];
+                    timer->cb_func = cb_func;
+                    time_t cur = time(NULL);
+                    timer->expire = cur + 3 * TIMESLOT;
+                    users_timer[connfd].timer = timer;
+                    timer_lst.add_timer(timer);
+                }
+                continue;
+#endif
+            }
+
+		  //2.处理异常事件
+            else if (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR))
+            {
+                //服务器端关闭连接，移除对应的定时器
+                util_timer *timer = users_timer[sockfd].timer;
+                timer->cb_func(&users_timer[sockfd]);
+
+                if (timer)
+                {
+                    timer_lst.del_timer(timer);
+                }
+            }
+			
 		  //3.处理信号
 		  //管道读端对应文件描述符发生读事件
 		  else if((sockfd == pipefd[0]) && (events[i].events & EPOLLIN)){
+
+			char signals[1024];
+			
 			//从管道读端读出信号值，成功则返回字节数，失败则返回-1
 			//正常情况下，这里的ret返回值总是1，只有14和15两个ascii码对应的字符
 			ret = recv(pipefd[0], signals, sizeof(signals), 0);
@@ -214,8 +325,94 @@ int main(int argc, char *argv[]){
 				}
 			}
 		  }
+
+		  
+
+		  //4.处理客户连接上接收到的数据
+            else if (events[i].events & EPOLLIN)
+            {
+				//创建定时器临时变量，将该连接对应的定时器取出来
+                util_timer *timer = users_timer[sockfd].timer;
+                //读入对应缓冲区
+                if (users[sockfd].read_once())
+                {
+                    LOG_INFO("deal with the client(%s)", inet_ntoa(users[sockfd].get_address()->sin_addr));
+                    Log::get_instance()->flush();
+
+                    //若监测到读事件，将该事件放入请求队列
+                    pool->append(users + sockfd);
+
+                    //若有数据传输，则将定时器往后延迟3个单位
+                    //并对新的定时器在链表上的位置进行调整
+                    if (timer)
+                    {
+                        time_t cur = time(NULL);
+                        timer->expire = cur + 3 * TIMESLOT;
+                        LOG_INFO("%s", "adjust timer once");
+                        Log::get_instance()->flush();
+
+                        timer_lst.adjust_timer(timer);
+                    }
+                }
+                else
+                {
+                    timer->cb_func(&users_timer[sockfd]);
+                    if (timer)
+                    {
+                        timer_lst.del_timer(timer);
+                    }
+                }
+            }
+
+			//5.处理写事件，服务器通过连接给浏览器发送数据
+			else if (events[i].events & EPOLLOUT)
+            {
+                util_timer *timer = users_timer[sockfd].timer;
+                if (users[sockfd].write())
+                {
+                    LOG_INFO("send data to the client(%s)", inet_ntoa(users[sockfd].get_address()->sin_addr));
+                    Log::get_instance()->flush();
+
+                    //若有数据传输，则将定时器往后延迟3个单位
+                    //并对新的定时器在链表上的位置进行调整
+                    if (timer)
+                    {
+                        time_t cur = time(NULL);
+                        timer->expire = cur + 3 * TIMESLOT;
+                        LOG_INFO("%s", "adjust timer once");
+                        Log::get_instance()->flush();
+                        timer_lst.adjust_timer(timer);
+                    }
+                }
+                else
+                {
+					//服务器端关闭连接，移除对应的定时器
+                    timer->cb_func(&users_timer[sockfd]);
+                    if (timer)
+                    {
+                        timer_lst.del_timer(timer);
+                    }
+                }
+            }
 		  
 		  
 		}
+		
+		//处理定时器为非必须事件，收到信号并不是立马处理
+		//完成读写事件后，再进行处理
+		if (timeout)
+        {
+            timer_handler();
+            timeout = false;
+        }
 	}
+
+	close(epollfd);
+    close(listenfd);
+    close(pipefd[1]);
+    close(pipefd[0]);
+    delete[] users;
+    delete[] users_timer;
+    delete pool;
+    return 0;
 }
